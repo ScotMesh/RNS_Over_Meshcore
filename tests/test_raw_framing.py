@@ -170,13 +170,25 @@ def _iface_stub():
     return obj
 
 
-def test_path_for_truncates_multibyte_hashes():
+def test_path_for_native_and_1byte_forms():
     ifc = _iface_stub()
     assert ifc._path_for(None) is None
     assert ifc._path_for({"out_path_len": -1}) is None
-    assert ifc._path_for({"out_path_len": 0, "out_path": ""}) == b""
-    assert ifc._path_for({"out_path_len": 2, "out_path_hash_mode": 0, "out_path": "aabb"}) == b"\xaa\xbb"
-    assert ifc._path_for({"out_path_len": 2, "out_path_hash_mode": 1, "out_path": "aa11bb22"}) == b"\xaa\xbb"
+    assert ifc._path_for({"out_path_len": 0, "out_path": ""}) == (b"", 0)
+    one = {"out_path_len": 2, "out_path_hash_mode": 0, "out_path": "aabb"}
+    assert ifc._path_for(one) == (b"\xaa\xbb", 2) == ifc._path_for(one, native=False)
+    two = {"out_path_len": 2, "out_path_hash_mode": 1, "out_path": "aa11bb22"}
+    # firmware dev / openHop: encoded path_len = mode<<6 | hops, full hashes kept
+    assert ifc._path_for(two, native=True) == (b"\xaa\x11\xbb\x22", 0x42)
+    # firmware v1.17.1: byte count, hashes truncated to their first byte
+    assert ifc._path_for(two, native=False) == (b"\xaa\xbb", 2)
+    assert ifc._path_for({"out_path_len": 3, "out_path_hash_mode": 1, "out_path": "aa11"}) is None
+
+
+def test_send_raw_data_encoded_path_len():
+    c = _Capture(); c.loop = asyncio.new_event_loop()
+    c.loop.run_until_complete(c.send_raw_data(b"\xaa\x11\xbb\x22", b"abcd", 0x42))
+    assert c.sent[0] == bytes([25, 0x42, 0xaa, 0x11, 0xbb, 0x22]) + b"abcd"
 
 
 def test_default_sizes_fit_ble_frames():

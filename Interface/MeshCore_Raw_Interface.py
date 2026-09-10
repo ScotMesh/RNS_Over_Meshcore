@@ -81,12 +81,25 @@ CONFIGURATION
     outgoing_path_req_rate = 1800
     rate_limit = 0
     allow_direct = yes
+    raw_path_hashes = auto     # auto | native | 1byte -- see "Raw paths" below
     path_discovery_rate = 600
     path_discovery_timeout = 20
     advert_on_start = yes
     can_route = yes
     peer_ttl = 86400
     debug_level = info
+
+RAW PATHS
+---------
+CMD_SEND_RAW_DATA takes the repeater path plus a path_len byte. Firmware
+v1.17.1 (release) reads that byte as a plain byte count, so only 1-byte
+repeater hashes work; firmware `dev` and openHop read MeshCore's encoded
+form (hash_mode << 6 | hops) and accept multi-byte hashes. For 1-byte-hash
+paths the two agree. With raw_path_hashes = auto the interface sends the
+contact's native hash size and, if the radio rejects it, truncates every hop
+to its first byte for the rest of the session (a 1-byte hash is a prefix of
+the longer one, so repeaters still match, with a slightly higher collision
+risk).
 
 Requires companion firmware with CMD_SEND_RAW_DATA and CMD_SEND_CHANNEL_DATA
 (v1.17 has both) or openHop's virtual companion. Older firmware answers those
@@ -524,12 +537,20 @@ class _Companion:
                  + (data_type & 0xFFFF).to_bytes(2, "little") + payload)
         return self._check(await self.command(frame, (self.RESP_OK, self.RESP_ERR)), "SEND_CHANNEL_DATA")
 
-    async def send_raw_data(self, path, payload):
+    async def send_raw_data(self, path, payload, path_len_byte=None):
+        """
+        CMD_SEND_RAW_DATA. `path_len_byte` is the value written to the frame:
+        firmware v1.17.1 reads it as a byte count (1-byte hashes only); firmware
+        `dev` and openHop read it as MeshCore's encoded form, hash-mode << 6 |
+        hop count. For 1-byte-hash paths the two are the same number.
+        """
         if len(payload) < 4:
             raise _CompanionError("raw payload must be at least 4 bytes")
         if len(path) > 64:
             raise _CompanionError("path too long")
-        frame = bytes([self.CMD_SEND_RAW_DATA, len(path)]) + path + payload
+        if path_len_byte is None:
+            path_len_byte = len(path)
+        frame = bytes([self.CMD_SEND_RAW_DATA, path_len_byte & 0xFF]) + path + payload
         return self._check(await self.command(frame, (self.RESP_OK, self.RESP_ERR)), "SEND_RAW_DATA")
 
     async def path_discovery(self, pubkey32, timeout=20.0):
@@ -784,6 +805,13 @@ class MeshCore_Raw_Interface(Interface):
         self.retransmit_jitter_max_s   = float(cfg.get("retransmit_jitter_max", 20.0))
 
         self.allow_direct   = _bool("allow_direct")
+        # auto: send the contact's native hash size, fall back to 1-byte hops if the
+        # radio rejects it. native: always encoded (firmware dev / openHop).
+        # 1byte: always truncate (firmware v1.17.1 release).
+        self.raw_path_hashes = str(cfg.get("raw_path_hashes", "auto")).strip().lower()
+        if self.raw_path_hashes not in ("auto", "native", "1byte"):
+            raise ValueError("raw_path_hashes must be auto, native or 1byte")
+        self._raw_native_paths = self.raw_path_hashes != "1byte"
         self.can_route      = _bool("can_route")
         self.advert_on_start = _bool("advert_on_start")
         self.path_discovery_rate_s    = float(cfg.get("path_discovery_rate", 600))
@@ -1033,22 +1061,34 @@ class MeshCore_Raw_Interface(Interface):
 
     # ---------------------------------------------------------------- paths
 
-    def _path_for(self, contact):
-        """Path bytes for CMD_SEND_RAW_DATA (1-byte hashes), or None if unknown."""
+    def _path_for(self, contact, native=True):
+        """
+        (path_bytes, path_len_byte) for CMD_SEND_RAW_DATA, or None if no path is known.
+
+        native=True keeps the contact's hash size and encodes path_len as
+        hash_mode << 6 | hops (firmware `dev`, openHop). native=False truncates
+        every hop to its first byte and sends a plain hop count, which is all
+        firmware v1.17.1 understands. Identical for 1-byte-hash paths.
+        """
         if contact is None:
             return None
         n = contact.get("out_path_len", -1)
         if n is None or n < 0:
             return None
         if n == 0:
-            return b""
-        mode = max(0, contact.get("out_path_hash_mode", 0))
+            return b"", 0
+        mode = max(0, contact.get("out_path_hash_mode", 0) or 0)
         raw = bytes.fromhex(contact.get("out_path", "") or "")
         step = mode + 1
-        hops = [raw[i:i + 1] for i in range(0, min(len(raw), n * step), step)]
-        if len(hops) != n:
+        if len(raw) < n * step:
             return None
-        return b"".join(hops)[:64]
+        if native and mode > 0:
+            path = raw[:n * step]
+            if len(path) > 64:
+                return None
+            return path, (mode << 6) | (n & 0x3F)
+        hops = [raw[i:i + 1] for i in range(0, n * step, step)]
+        return b"".join(hops)[:64], n & 0x3F
 
     async def _ensure_path(self, prefix):
         """Rate-limited path discovery for a peer; adds a contact first if needed."""
@@ -1312,20 +1352,36 @@ class MeshCore_Raw_Interface(Interface):
             try:
                 if mode == "direct":
                     contact = self._mc.contact_by_prefix(target.hex())
-                    path = self._path_for(contact)
-                    if path is None:
+                    route = self._path_for(contact, native=self._raw_native_paths)
+                    if route is None:
                         self._dbg(f"no path to {target.hex()}; sending via CHANNEL and discovering")
                         self._loop.create_task(self._ensure_path(target))
                         await self._mc.send_channel_data(self.channel_idx, self.data_type, frag)
                         sent_mode = "channel"
                     else:
+                        path, plen = route
                         frame_len = 2 + len(path) + len(frag)
                         if frame_len > _Companion.MAX_FRAME:
-                            self._dbg(f"raw frame would be {frame_len}b with {len(path)} hops; using CHANNEL")
+                            self._dbg(f"raw frame would be {frame_len}b with a {len(path)}-byte path; using CHANNEL")
                             await self._mc.send_channel_data(self.channel_idx, self.data_type, frag)
                             sent_mode = "channel"
                         else:
-                            await self._mc.send_raw_data(path, frag)
+                            try:
+                                await self._mc.send_raw_data(path, frag, plen)
+                            except _CompanionError as e:
+                                # A v1.17.1-era radio reads path_len as a byte count and rejects
+                                # the encoded form for multi-byte hashes. Drop to 1-byte hops for
+                                # the rest of the session and resend this fragment that way.
+                                rejected = ("UNSUPPORTED_CMD" in str(e)) or ("ILLEGAL_ARG" in str(e))
+                                if (self.raw_path_hashes == "auto" and self._raw_native_paths
+                                        and plen >= 0x40 and rejected):
+                                    self._raw_native_paths = False
+                                    self._log("radio rejected multi-byte raw paths; using 1-byte hop hashes from now on "
+                                              "(firmware v1.17.1 behaviour)", RNS.LOG_WARNING)
+                                    path, plen = self._path_for(contact, native=False)
+                                    await self._mc.send_raw_data(path, frag, plen)
+                                else:
+                                    raise
                 else:
                     await self._mc.send_channel_data(self.channel_idx, self.data_type, frag)
             except Exception as e:

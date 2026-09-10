@@ -279,7 +279,7 @@ Raw packets carry no MeshCore addressing and every radio in earshot of the last 
 
 Companion frames must fit one BLE ATT write (firmware negotiates MTU 176 → 173 bytes per frame, in both directions), so the defaults keep every command and push frame at or under 173 bytes: `raw_payload_size = 140` (cmd frame `2 + hops + 14 + 140`, fine to 17 hops) and `channel_payload_size = 148` (`162 ≤ MAX_GROUP_DATA_LENGTH = 165`). Over serial or TCP the same limits apply, since the firmware's frame buffer is 176 bytes.
 
-Raw paths use 1-byte repeater hashes: firmware treats the raw command's `path_len` as a byte count, so a contact whose path was learned with multi-byte hashes is truncated to one byte per hop (a prefix, so repeaters still match).
+**Raw paths and hash size.** `CMD_SEND_RAW_DATA` takes the repeater path plus a `path_len` byte. The **v1.17.1 release** reads that byte as a plain byte count, so it only works with 1-byte repeater hashes; firmware **`dev`** (next release) and **openHop** read MeshCore's encoded form (`hash_mode << 6 | hops`) and accept multi-byte hashes. For 1-byte-hash paths the two agree. `raw_path_hashes = auto` (default) sends the contact's native hash size and, if the radio rejects it, truncates every hop to its first byte for the rest of the session (a 1-byte hash is a prefix of the longer one, so repeaters still match). Set `native` or `1byte` to force either.
 
 ### Requirements
 
