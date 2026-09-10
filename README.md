@@ -1,3 +1,21 @@
+# RNS over MeshCore — ScotMesh fork
+
+> **This is a fork of [comms-engineer/RNS_Over_Meshcore](https://github.com/comms-engineer/RNS_Over_Meshcore), maintained by ScotMesh for our own deployment. It is not going back upstream** — no pull request is planned, and this repository will not track upstream changes. If you want the original, use the link above.
+>
+> **What is different here**
+>
+> | | Original (`comms-engineer`) | This fork (`A13xB0`) |
+> |---|---|---|
+> | Transport on the air | MeshCore **text** messages: base64 fragments inside channel text and direct messages | Adds `Interface/MeshCore_Raw_Interface.py`: **binary payloads** — raw-custom packets (`CMD_SEND_RAW_DATA`) for unicast on an explicit repeater path, binary channel datagrams (`CMD_SEND_CHANNEL_DATA`) for broadcast. No base64, no `"RNS:"`/name prefixes, no MeshCore ACK round-trips |
+> | Fragment size | 64 B payload (≈128-char text limit); a 500-byte RNS packet is 8 fragments | 140 B raw / 148 B channel; the same packet is 4 fragments. Every companion frame ≤ 173 B so BLE works |
+> | Dependencies | `meshcore` Python library | None beyond `rns` — the raw interface carries its own minimal companion client for serial, TCP and BLE |
+> | Hosts | rnsd | rnsd, **MeshChatX** (custom interface module) and **Sideband** (service plugin in `sideband/`, TCP-only on Android) |
+> | Repeaters | Stock MeshCore | Stock MeshCore **and openHop virtual companions**, verified against both code bases |
+> | Tests | none | `tests/`: framing, byte-exact command layouts, and a loopback over a fake companion mesh |
+> | Original interfaces | — | Kept **unchanged** (`MeshCore_Dynamic_Interface.py`, `MeshCore_Channel_Interface.py`, `MeshCore_Interface.py`). The text and raw formats do not interoperate; every node on a tunnel must use the same one |
+>
+> The rest of this README is the original project's documentation for the text interface, left as it was, with a **Raw transport** section further down for ours. Credit for the discovery/routing design and the original code goes to [comms-engineer](https://github.com/comms-engineer).
+
 # MeshCore Dynamic Interface
 
 A [Reticulum Network Stack (RNS)](https://reticulum.network/) custom interface that tunnels RNS traffic over a [MeshCore](https://meshcore.co.uk/) LoRa mesh. It requires no static remote-node configuration — peers discover each other dynamically over the air — and uses a hybrid channel-broadcast / unicast-direct routing strategy to keep airtime usage on a shared, half-duplex LoRa channel as low as possible.
