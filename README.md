@@ -221,6 +221,114 @@ A MeshCore `MSG_SENT` result only confirms the local radio queued the frame — 
 | `can_route` | `yes` | Whether this node can carry transit traffic |
 | `debug_level` | `info` | `info` or `debug` |
 
+## Raw transport (`MeshCore_Raw_Interface.py`)
+
+A second interface, `Interface/MeshCore_Raw_Interface.py`, carries the tunnel as **binary MeshCore payloads** instead of text messages. It keeps the peer-discovery, routing and rate-limiting design above but changes what goes on the air:
+
+| | Text tunnel (`MeshCore_Dynamic_Interface`) | Raw tunnel (`MeshCore_Raw_Interface`) |
+|---|---|---|
+| Broadcast (announces, path requests, discovery) | Channel **text** message, base64, `"RNS:"` prefix, firmware adds `"name: "` | Channel **datagram** (`PAYLOAD_TYPE_GRP_DATA`, `CMD_SEND_CHANNEL_DATA`), binary, channel-encrypted, flood-routed |
+| Unicast to a known peer | Direct **text** message, per-contact encryption, ACK wait | **Raw custom packet** (`PAYLOAD_TYPE_RAW_CUSTOM`, `CMD_SEND_RAW_DATA`) on an explicit repeater path; no MeshCore encryption or ACK — RNS already provides both |
+| Fragment payload | 64 B (≈128-char text limit) | 140 B raw / 148 B channel |
+| 500-byte RNS packet | 8 fragments | 4 fragments |
+| Dependencies | `meshcore` library | none beyond `rns` (+ `pyserial` for serial, `bleak` for BLE) |
+
+The two formats do **not** interoperate: every node on a tunnel must run the same interface.
+
+### Why two primitives
+
+MeshCore firmware only sends raw-custom packets on a *direct* route: `CMD_SEND_RAW_DATA` with no path returns `ERR_CODE_UNSUPPORTED_CMD` for flood, receivers drop raw packets that arrive by flood, and repeaters never re-broadcast them. Anything that has to reach every peer therefore goes as a channel datagram, which repeaters flood like any group message. Raw packets *are* forwarded by repeaters along an explicit path, which is what unicast uses once a path is known.
+
+### Wire format
+
+Every datagram, on either primitive, starts with a 14-byte header:
+
+```
+off size field
+0   1    magic       0x52 ('R')
+1   1    type/flags  low nibble: 0 = RNS fragment, 1 = BIND_REQ, 2 = BIND;  bit 4 = can route
+2   4    src         first 4 bytes of the sender's MeshCore public key
+6   4    dst         first 4 bytes of the target's key, or 00000000 = broadcast
+10  2    pkt_id      big-endian, per-sender rolling
+12  1    frag_idx
+13  1    frag_total
+14  ...  payload     RNS fragment, or the sender's full 32-byte key for BIND / BIND_REQ
+```
+
+Raw packets carry no MeshCore addressing and every radio in earshot of the last hop hands them to its app, so receivers drop anything whose `dst` is neither zero nor their own prefix. Discovery is the same `BIND_REQ` / `BIND` dance as the text tunnel, in binary, and the full key it carries lets the receiver add a contact and run MeshCore **path discovery** (`CMD_SEND_PATH_DISCOVERY_REQ`) so that raw sends have a path. Until a path is known, unicast traffic falls back to channel datagrams.
+
+### Sizes
+
+Companion frames must fit one BLE ATT write (firmware negotiates MTU 176 → 173 bytes per frame, in both directions), so the defaults keep every command and push frame at or under 173 bytes: `raw_payload_size = 140` (cmd frame `2 + hops + 14 + 140`, fine to 17 hops) and `channel_payload_size = 148` (`162 ≤ MAX_GROUP_DATA_LENGTH = 165`). Over serial or TCP the same limits apply, since the firmware's frame buffer is 176 bytes.
+
+Raw paths use 1-byte repeater hashes: firmware treats the raw command's `path_len` as a byte count, so a contact whose path was learned with multi-byte hashes is truncated to one byte per hop (a prefix, so repeaters still match).
+
+### Requirements
+
+- Companion firmware with `CMD_SEND_RAW_DATA` (25) and `CMD_SEND_CHANNEL_DATA` (62) — **v1.17** has both. Older firmware answers `ERR_CODE_UNSUPPORTED_CMD`; the interface logs it and keeps running channel-only if at least that command works.
+- **openHop** repeaters: the virtual companions (`companions[].tcp_port` in `config.yaml`) implement both commands and the matching pushes, and the repeater forwards raw packets on a direct path and floods channel datagrams. Use `transport = tcp` against the companion's port (one client per companion at a time).
+- Transports: `tcp` (any Python), `serial` (`pyserial`), `ble` (`bleak`).
+
+### Configuration
+
+```ini
+[[MeshCore Raw]]
+  type = MeshCore_Raw_Interface
+  interface_enabled = yes
+  mode = access_point
+
+  transport = tcp            # tcp | serial | ble
+  host = 127.0.0.1           # tcp: companion firmware over WiFi, or an openHop virtual companion
+  tcp_port = 5000
+  # port = /dev/ttyUSB0      # serial
+  # baudrate = 115200
+  # ble_name =               # ble: substring of the advertised name, or
+  # ble_address =            #      a MAC / UUID; blank = first MeshCore found
+  # ble_pin =                # optional pairing PIN
+
+  channel_idx = 0
+  channel_name = RNSTunnel
+  channel_secret = <32 hex chars>   # openssl rand -hex 16
+  data_type = 0xFFFF         # GRP_DATA data_type; 0xFFFF is MeshCore's app namespace
+
+  raw_payload_size = 140
+  channel_payload_size = 148
+  fragment_delay = 2.5
+  direct_frag_delay = 0.5
+  fragment_timeout = 300
+  outgoing_announce_rate = 600
+  outgoing_path_req_rate = 1800
+  rate_limit = 0
+  allow_direct = yes
+  path_discovery_rate = 600      # min seconds between path discoveries per peer
+  path_discovery_timeout = 20
+  advert_on_start = yes          # one flood self-advert so peers get a contact for us
+  can_route = yes
+  peer_ttl = 86400
+  debug_level = info
+```
+
+### Using it from rnsd, MeshChatX and Sideband
+
+- **rnsd / any Reticulum ≥ 1.x**: copy the file to `~/.reticulum/interfaces/` and add the block above.
+- **MeshChatX**: *Settings → Interfaces* can install a custom interface module; upload `MeshCore_Raw_Interface.py`, then add an interface of type `MeshCore_Raw_Interface` with the keys above (or import the config block). MeshChatX ships `pyserial` and `bleak`, so TCP, serial and BLE all work.
+- **Sideband**: desktop Sideband uses `~/.reticulum`, so the rnsd route works. To avoid config files entirely — and on **Android**, where there is no `~/.reticulum` to edit — use the service plugin in `sideband/meshcore_raw_service.py`: copy it together with `MeshCore_Raw_Interface.py` into the Sideband plugins directory, edit the `CONFIG` block at the top, enable *Service plugins*, restart. The Android build has neither `pyserial` nor `bleak`, so on a phone only `transport = tcp` works (an openHop virtual companion on the LAN, for example).
+
+### Testing without hardware
+
+```bash
+pip install rns pytest pytest-timeout
+pytest tests/
+```
+
+`tests/fake_companion.py` is a fake companion mesh speaking the real frame protocol over TCP; the loopback test brings up two interfaces against it and checks discovery, a channel-carried announce, a raw-carried unicast after path discovery, and that no frame exceeds the BLE budget.
+
+### Raw-tunnel limits
+
+- No delivery ACK on raw sends: a stale repeater path silently loses fragments until the next (rate-limited) path discovery. RNS links retry; single datagrams do not.
+- Raw packets are not MeshCore-encrypted; the 14-byte header is visible on air. The RNS packet inside is encrypted end-to-end as always.
+- Multi-hop *flood* of raw packets is a firmware limitation ("don't flood route these (yet)").
+
 ## Limitations
 
 - MeshCore's channel-message character limit varies by firmware build and must be accounted for when choosing `payload_size` (see [Payload size](#payload-size)).
