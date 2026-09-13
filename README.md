@@ -1,10 +1,12 @@
+![ScotMesh Reticulum](https://raw.githubusercontent.com/ScotMesh/branding/main/networks/reticulum/readme-header.png)
+
 # RNS over MeshCore — ScotMesh fork
 
 > **This is a fork of [comms-engineer/RNS_Over_Meshcore](https://github.com/comms-engineer/RNS_Over_Meshcore), maintained by ScotMesh for our own deployment. It is not going back upstream** — no pull request is planned, and this repository will not track upstream changes. If you want the original, use the link above.
 >
 > **What is different here**
 >
-> | | Original (`comms-engineer`) | This fork (`A13xB0`) |
+> | | Original (`comms-engineer`) | This fork (`ScotMesh`) |
 > |---|---|---|
 > | Transport on the air | MeshCore **text** messages: base64 fragments inside channel text and direct messages | Adds `Interface/MeshCore_Raw_Interface.py`: **binary payloads** — raw-custom packets (`CMD_SEND_RAW_DATA`) for unicast on an explicit repeater path, binary channel datagrams (`CMD_SEND_CHANNEL_DATA`) for broadcast. No base64, no `"RNS:"`/name prefixes, no MeshCore ACK round-trips |
 > | Fragment size | 64 B payload (≈128-char text limit); a 500-byte RNS packet is 8 fragments | 140 B raw / 148 B channel; the same packet is 4 fragments. Every companion frame ≤ 173 B so BLE works |
