@@ -311,6 +311,19 @@ Companion frames must fit one BLE ATT write (firmware negotiates MTU 176 → 173
   channel_secret = <32 hex chars>   # openssl rand -hex 16
   data_type = 0xFFFF         # GRP_DATA data_type; 0xFFFF is MeshCore's app namespace
 
+  # Flood scope - confines this interface's flood sends (self adverts, BIND
+  # broadcasts, channel datagrams) to one named MeshCore region instead of the
+  # public unscoped mesh. A repeater configured for a different region (or none)
+  # won't relay them - this is the same mechanism as a repeater's own
+  # mesh.default_region (openHop) / named region (firmware), applied to what a
+  # companion transmits rather than what a repeater relays by default.
+  # Leave both unset for today's behaviour (unscoped).
+  flood_scope = sco          # public region name; key is sha256("#" + name)[:16],
+                              # byte-identical to openhop_core get_auto_key_for()
+  # flood_scope_key = <32 hex chars>   # overrides the derived key - required for
+                              # a private "$region" whose key the name can't
+                              # reproduce; takes precedence over flood_scope if both are set
+
   raw_payload_size = 140
   channel_payload_size = 148
   fragment_delay = 2.5
