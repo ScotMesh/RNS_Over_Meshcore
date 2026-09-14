@@ -79,6 +79,7 @@ CONFIGURATION
     fragment_timeout = 300
     outgoing_announce_rate = 600
     outgoing_path_req_rate = 1800
+    announce_max_hops = 2      # see "Announce hop limit" below
     rate_limit = 0
     allow_direct = yes
     raw_path_hashes = auto     # auto | native | 1byte -- see "Raw paths" below
@@ -105,6 +106,33 @@ Requires companion firmware with CMD_SEND_RAW_DATA and CMD_SEND_CHANNEL_DATA
 (v1.17 has both) or openHop's virtual companion. Older firmware answers those
 commands with ERR_CODE_UNSUPPORTED_CMD; the interface logs that and keeps
 running channel-only (text-tunnel peers are NOT compatible with this format).
+
+ANNOUNCE HOP LIMIT
+-------------------
+On a Reticulum transport node (enable_transport = yes), this interface's
+"mode" setting controls announce propagation same as any RNS interface. The
+restrictive modes (access_point, internal, roaming, boundary) block proactive
+announce broadcast outright; every other mode -- including full and gateway --
+lets RNS relay an individual announce for every destination the transport
+node knows about as each one periodically re-announces. On a node that also
+carries a large backbone (thousands of known routes via other interfaces),
+running this interface in one of those less-restrictive modes means all of
+that route table eventually gets announced onto this MeshCore channel too --
+observed directly during development of this feature: switching a transport
+node's MeshCore interface to full mode produced a sustained ~30 packets/minute
+of announce traffic onto a real, shared community LoRa channel serving other
+operators' traffic.
+
+announce_max_hops caps this independently of whatever mode allows: any
+outgoing announce that has already travelled more than the configured number
+of RNS hops to reach this node is dropped before it reaches the radio, in
+process_outgoing(), regardless of the interface's mode. Path responses are
+exempt, so on-demand path lookups for far-away destinations still work; only
+proactive re-announces are capped. Default is 2 hops. Set higher for more
+reach at the cost of relaying more of what a transport node's other
+interfaces bring in, or unset (announce_max_hops = 0 disables the check
+entirely) if you understand the tradeoff and want it off, e.g. on a node
+that isn't also a transport node for another large network.
 """
 
 import asyncio
@@ -866,6 +894,11 @@ class MeshCore_Raw_Interface(Interface):
         self._path_response_bypass_s  = float(cfg.get("path_response_bypass_window", 15))
         self.announce_retransmit_extra = int(cfg.get("announce_retransmit_extra", 2))
         self.path_req_retransmit_extra = int(cfg.get("path_req_retransmit_extra", 0))
+        # See "ANNOUNCE HOP LIMIT" above. Defaults on: a transport node that
+        # picks a less-restrictive mode (full, gateway, ...) without setting
+        # this can end up relaying its entire known route table onto a shared
+        # channel. 0 disables the check for callers who understand the tradeoff.
+        self.announce_max_hops = int(cfg.get("announce_max_hops", 2))
         self.retransmit_jitter_min_s   = float(cfg.get("retransmit_jitter_min", 8.0))
         self.retransmit_jitter_max_s   = float(cfg.get("retransmit_jitter_max", 20.0))
 
@@ -1332,8 +1365,22 @@ class MeshCore_Raw_Interface(Interface):
 
     # ---------------------------------------------------------------- outbound
 
+    @staticmethod
+    def announce_exceeds_hops(data, max_hops):
+        """True for an RNS announce that has travelled more than max_hops to reach
+        this node. Path responses are exempt so on-demand path lookups still work.
+        max_hops of None or 0 disables the check (always returns False)."""
+        if not max_hops or len(data) < 19 or data[0] & 0x03 != 0x01:  # 0x01 = RNS_PTYPE_ANNOUNCE
+            return False
+        context_offset = 34 if data[0] & 0b01000000 else 18  # HEADER_2 carries a 16-byte transport id
+        if len(data) > context_offset and data[context_offset] == RNS.Packet.PATH_RESPONSE:
+            return False
+        return data[1] > max_hops
+
     def process_outgoing(self, data):
         if not self.online or not self._own_prefix:
+            return
+        if self.announce_exceeds_hops(data, self.announce_max_hops):
             return
         hdr = data[0] if data else 0
         ptype, dest_type = hdr & 0x03, (hdr >> 2) & 0x03
