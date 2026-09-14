@@ -182,6 +182,25 @@ class _CompanionError(Exception):
     pass
 
 
+def region_scope_key(name):
+    """16-byte MeshCore transport key for a public region/scope name.
+
+    ``sha256("#" + name)[:16]`` - matches firmware's
+    ``TransportKeyStore::getAutoKeyFor`` and openhop_core's
+    ``get_auto_key_for``/``set_flood_region``, so a name like ``"sco"`` here
+    reproduces exactly the key an openHop repeater derives from
+    ``mesh.default_region: sco`` (see ``region_map_builder.py`` upstream) or a
+    real MeshCore repeater's region config. Only for *public* regions - one
+    whose name does not start with ``$``; a private ``$region`` is keyed with
+    material the name can't reproduce, so use ``flood_scope_key`` (a literal
+    32-hex-char key) for those instead.
+    """
+    canonical = name if name.startswith("#") else f"#{name}"
+    if len(canonical) > 64:
+        raise ValueError("region/scope name too long (max 64 characters)")
+    return hashlib.sha256(canonical.encode("ascii")).digest()[:16]
+
+
 class _Companion:
     """
     Just enough of the MeshCore companion protocol for this interface.
@@ -202,7 +221,9 @@ class _Companion:
     CMD_GET_CHANNEL          = 31
     CMD_SET_CHANNEL          = 32
     CMD_SEND_PATH_DISCOVERY  = 52
+    CMD_SET_FLOOD_SCOPE      = 54
     CMD_SEND_CHANNEL_DATA    = 62
+    CMD_SET_DEFAULT_FLOOD_SCOPE = 63
 
     # responses
     RESP_OK                  = 0
@@ -489,6 +510,33 @@ class _Companion:
         name_b = name.encode("utf-8")[:32].ljust(32, b"\x00")
         frame = bytes([self.CMD_SET_CHANNEL, idx]) + name_b + secret16
         return self._check(await self.command(frame, (self.RESP_OK, self.RESP_ERR)), "SET_CHANNEL")
+
+    async def set_flood_scope(self, key16):
+        """CMD_SET_FLOOD_SCOPE_KEY, mode 0: set this companion's transient flood
+        scope override. Every subsequent flood send (channel datagrams, self
+        adverts, BIND/BIND_REQ broadcasts) carries this key's transport codes
+        instead of going out unscoped, so a repeater with a matching named
+        region (or ``mesh.default_region``, on openHop) will relay it while one
+        scoped/configured for a different region silently won't.
+        `key16` of None resets to unscoped (mirrors firmware's else-branch for
+        a mode-0 frame with no key bytes)."""
+        frame = bytes([self.CMD_SET_FLOOD_SCOPE, 0]) + (key16 if key16 else b"")
+        return self._check(await self.command(frame, (self.RESP_OK, self.RESP_ERR)), "SET_FLOOD_SCOPE")
+
+    async def set_default_flood_scope(self, name, key16):
+        """CMD_SET_DEFAULT_FLOOD_SCOPE (63): the *persistent* scope self-adverts
+        and other firmware auto-replies use - separate from set_flood_scope's
+        transient per-session override, which SEND_SELF_ADVERT does not consult
+        (confirmed in openhop_core: advertise() calls _apply_default_flood_scope,
+        never the transient key). Both need setting for every flood this
+        companion originates to actually carry the same scope.
+        `name` of None/empty clears it (mirrors firmware's short-frame branch)."""
+        if name:
+            name_b = name.encode("utf-8")[:31].ljust(31, b"\x00")
+            frame = bytes([self.CMD_SET_DEFAULT_FLOOD_SCOPE]) + name_b + key16
+        else:
+            frame = bytes([self.CMD_SET_DEFAULT_FLOOD_SCOPE])
+        return self._check(await self.command(frame, (self.RESP_OK, self.RESP_ERR)), "SET_DEFAULT_FLOOD_SCOPE")
 
     async def send_advert(self, flood=True):
         frame = bytes([self.CMD_SEND_SELF_ADVERT]) + (b"\x01" if flood else b"")
@@ -782,6 +830,23 @@ class MeshCore_Raw_Interface(Interface):
         if self.data_type == 0:
             raise ValueError("data_type 0 is reserved by MeshCore")
 
+        # flood scope - confines flood sends (adverts, BIND broadcasts, channel
+        # datagrams) to a named MeshCore region, e.g. "sco". Unset = unscoped,
+        # today's behaviour. flood_scope_key (32 hex chars) overrides the
+        # derived key for a private "$region" whose key the name can't
+        # reproduce; flood_scope alone is enough for a public region name.
+        flood_scope = str(cfg.get("flood_scope", "")).strip()
+        flood_scope_key = str(cfg.get("flood_scope_key", "")).strip()
+        if flood_scope_key:
+            self.flood_scope_key = bytes.fromhex(flood_scope_key)
+            if len(self.flood_scope_key) != 16:
+                raise ValueError("flood_scope_key must be 32 hex characters (16 bytes)")
+        elif flood_scope:
+            self.flood_scope_key = region_scope_key(flood_scope)
+        else:
+            self.flood_scope_key = None
+        self.flood_scope_name = flood_scope or None
+
         # sizes
         self.raw_payload_size     = int(cfg.get("raw_payload_size", 140))
         self.channel_payload_size = int(cfg.get("channel_payload_size", 148))
@@ -918,6 +983,19 @@ class MeshCore_Raw_Interface(Interface):
                     await self._mc.set_channel(self.channel_idx, self.channel_name, self.channel_secret)
                 except Exception as e:
                     self._log(f"SET_CHANNEL failed ({e}); assuming channel {self.channel_idx} is already configured", RNS.LOG_WARNING)
+                if self.flood_scope_key is not None:
+                    try:
+                        await self._mc.set_flood_scope(self.flood_scope_key)
+                        self._log(f"flood scope set to '{self.flood_scope_name}' "
+                                  f"({self.flood_scope_key.hex()})")
+                    except Exception as e:
+                        self._log(f"SET_FLOOD_SCOPE failed ({e}); floods will go out unscoped "
+                                  f"and a scoped repeater won't relay them", RNS.LOG_WARNING)
+                    try:
+                        await self._mc.set_default_flood_scope(self.flood_scope_name, self.flood_scope_key)
+                    except Exception as e:
+                        self._log(f"SET_DEFAULT_FLOOD_SCOPE failed ({e}); self-adverts will "
+                                  f"go out unscoped even though other sends are scoped", RNS.LOG_WARNING)
                 try:
                     await self._mc.get_contacts()
                     self._dbg(f"{len(self._mc.contacts)} contacts cached")
