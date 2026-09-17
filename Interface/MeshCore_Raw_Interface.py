@@ -1531,6 +1531,19 @@ class MeshCore_Raw_Interface(Interface):
     async def _cleanup_loop(self):
         while not self._detached:
             await asyncio.sleep(30)
+            # Keepalive: companions enforce an idle tcp_timeout (openHop default
+            # 120s) and drop a silent connection. The discovery burst covers the
+            # first ~2 minutes after connect, but once bound (or given up after
+            # BIND_MAX_RETRIES) the interface can otherwise go fully idle for up
+            # to BIND_HEARTBEAT_S (1h) - long past the timeout. A cheap read-only
+            # command every 30s resets the server's idle timer without side
+            # effects; failures are expected during a reconnect and are silently
+            # dropped rather than logged, since _bring_up already logs the loss.
+            if self._mc is not None and self._mc.connected:
+                try:
+                    await self._mc.device_query()
+                except Exception:
+                    pass
             now = time.monotonic()
             with self._asm_lock:
                 for k in [k for k, (_, ts) in self._assembly_meta.items() if ts < now - self.fragment_timeout_s]:
