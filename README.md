@@ -211,6 +211,40 @@ The capability suffix (`R` = router, `E` = edge) tells peers at discovery time w
 
 The interface inspects the RNS header byte to distinguish packet types (`DATA`, `ANNOUNCE`, `LINKREQUEST`, `PROOF`) and destination types (`SINGLE`, `GROUP`, `PLAIN`, `LINK`), and locally derives the destination hash for established Links (whose destination field becomes an ephemeral Link ID after handshake) so that direct-message routing continues to work for the life of the Link.
 
+### Learning a route
+
+`CMD_SEND_RAW_DATA` needs a repeater path, and on the firmware tested here
+there is no working way to ask for one: `CMD_SEND_PATH_DISCOVERY_REQ` is
+accepted and relayed but never answered (20 requests, v1.17.1 and a `main`
+build), adverts do not populate `out_path`, and `add_contact` writes
+`OUT_PATH_UNKNOWN`, which nothing then overwrites. The result is
+`out_path_len = -1` for the life of the session and every send falling back to
+a channel flood.
+
+The radio already supplies the answer. Push `0x88` reports each packet it
+handled together with the repeater hashes that packet crossed:
+
+    0x88 00 9c 0x18 | pkt id(2) | 00 00 | path_len(1) | path[path_len] | packet
+
+Reversing that path gives the route back to whoever sent it — confirmed on a
+two-hop chain, where a packet arriving over `[97 76]` had its ACK return over
+`[76 97]`. The interface pairs the reported path with the frame that follows
+it (within `rx_path_max_age`), reverses it, and writes it to the contact with
+`CMD_ADD_UPDATE_CONTACT`, after which raw sends are routed. Nothing extra goes
+on air: the information is carried by traffic that was already flowing.
+
+Subtype `0x18` and the two zero bytes gate the parse, and the packet that
+follows the path must begin with the MeshCore header byte `0xed`; other `0x88`
+subtypes carry a different shape and are ignored. `tests/test_path_learning.py`
+pins the layout to captured frames.
+
+One wrinkle: a node can only derive its *outbound* route from *inbound*
+traffic, so the quieter end of an asymmetric link — exactly where a route
+helps most — learns least. Each `RNSBIND` therefore also carries the paths the
+sender hears its peers over, addressed by peer prefix, which is the route out
+that those peers cannot observe for themselves. Installed as-is, not reversed;
+older builds read the 32-byte key and ignore the remainder.
+
 ### Delivery confirmation
 
 A MeshCore `MSG_SENT` result only confirms the local radio queued the frame — it isn't end-to-end delivery confirmation. For direct sends, the interface waits on the firmware's follow-up `ACK` event (matched via the `expected_ack` tag from `MSG_SENT`), bounded by `direct_ack_timeout` and a hard ceiling `direct_ack_timeout_max` so that a flood-mode peer with a long firmware-suggested timeout can't stall every other fragment behind it in the shared outgoing queue. A failed or unacknowledged direct send falls back to a channel broadcast.
@@ -237,6 +271,8 @@ A MeshCore `MSG_SENT` result only confirms the local radio queued the frame — 
 | `outgoing_path_req_rate` | `1800` | Minimum seconds between path requests per destination (`0` disables) |
 | `rate_limit` | `0` | Optional hard bandwidth cap in bits/second (`0` disables) |
 | `allow_direct` | `yes` | Use unicast direct messages when a route to the peer is known |
+| `learn_path_from_rx` | `yes` | Learn a route to a peer by reversing the repeater path its packets arrived over; see [Learning a route](#learning-a-route) |
+| `rx_path_max_age` | `3.0` | Seconds a reported packet path stays valid for pairing with the frame that follows it |
 | `peer_ttl` | `86400` | Seconds before a silent peer is dropped from the peer table |
 | `can_route` | `yes` | Whether this node can carry transit traffic |
 | `debug_level` | `info` | `info` or `debug` |

@@ -277,6 +277,10 @@ class _Companion:
     PUSH_RAW_DATA            = 0x84
     PUSH_NEW_ADVERT          = 0x8A
     PUSH_PATH_DISCOVERY_RESP = 0x8D
+    # Undocumented, and the whole game: the radio reports every packet it
+    # handled together with the repeater hashes that packet crossed. That is
+    # the return path, free, with nothing extra on air.
+    PUSH_PACKET_PATH         = 0x88
 
     ERR_NAMES = {1: "UNSUPPORTED_CMD", 2: "NOT_FOUND", 3: "TABLE_FULL",
                  4: "BAD_STATE", 5: "FILE_IO_ERROR", 6: "ILLEGAL_ARG"}
@@ -310,6 +314,7 @@ class _Companion:
 
         # callbacks set by the interface
         self.on_raw_data     = None  # (payload: bytes, snr, rssi)
+        self.on_packet_path  = None  # (path: bytes) accumulated hops of a packet
         self.on_channel_data = None  # (chan_idx, data_type, payload: bytes)
         self.on_disconnect   = None
 
@@ -570,6 +575,33 @@ class _Companion:
         frame = bytes([self.CMD_SEND_SELF_ADVERT]) + (b"\x01" if flood else b"")
         return self._check(await self.command(frame, (self.RESP_OK, self.RESP_ERR)), "SEND_SELF_ADVERT")
 
+    async def set_contact_path(self, pubkey32, path, name=None):
+        """Give a contact an out_path, so raw sends can use it.
+
+        add_contact writes OUT_PATH_UNKNOWN and nothing ever overwrote it. The
+        same command sets a real path: the length byte is the hop count (hash
+        mode 0, one byte per hop, which is what the radio reports) and the path
+        occupies the first bytes of the 64-byte field.
+        """
+        path = bytes(path)[:64]
+        c = self.contacts.get(pubkey32.hex())
+        nm = (name or (c or {}).get("adv_name") or f"RNS-{pubkey32.hex()[:8]}")
+        name_b = nm.encode("utf-8")[:32].ljust(32, b"\x00")
+        frame = (bytes([self.CMD_ADD_UPDATE_CONTACT]) + pubkey32
+                 + bytes([(c or {}).get("type", 1) or 1])
+                 + bytes([(c or {}).get("flags", 0) or 0])
+                 + bytes([len(path) & 0x3F])
+                 + path.ljust(64, b"\x00")
+                 + name_b
+                 + int(time.time()).to_bytes(4, "little")
+                 + b"\x00" * 8)
+        self._check(await self.command(frame, (self.RESP_OK, self.RESP_ERR)), "ADD_UPDATE_CONTACT")
+        if c is not None:
+            c["out_path_hash_mode"] = 0
+            c["out_path_len"] = len(path)
+            c["out_path"] = path.hex()
+        return len(path)
+
     async def get_contacts(self, timeout=20.0):
         """Full contact download. Returns the refreshed cache."""
         if not self.connected:
@@ -691,6 +723,18 @@ class _Companion:
             c = self._parse_contact(frame)
             if c:
                 self.contacts[c["public_key"]] = c
+        elif code == self.PUSH_PACKET_PATH:
+            # 88 00 9c 18 | pkt id(2) | 00 00 | path_len(1) | path | packet
+            # Read off the wire, not guessed: an earlier parse took path_len
+            # four bytes early and produced fourteen-hop paths. Other 0x88
+            # subtypes (0x3e seen) carry a different shape, so the type byte
+            # and the two zero bytes gate the parse, and the packet that
+            # follows must start with the MeshCore header byte 0xed.
+            if (len(frame) >= 10 and frame[3] == 0x18 and frame[6:8] == b"\x00\x00"
+                    and self.on_packet_path):
+                n = frame[8]
+                if 0 < n <= 64 and len(frame) > 9 + n and frame[9 + n] == 0xED:
+                    self.on_packet_path(bytes(frame[9:9 + n]))
         elif code == self.PUSH_PATH_UPDATED:
             self._schedule_contact_refresh()
         elif code == self.PUSH_PATH_DISCOVERY_RESP:
@@ -914,6 +958,12 @@ class MeshCore_Raw_Interface(Interface):
         self.advert_on_start = _bool("advert_on_start")
         self.path_discovery_rate_s    = float(cfg.get("path_discovery_rate", 600))
         self.path_discovery_timeout_s = float(cfg.get("path_discovery_timeout", 20))
+        # Learn the way back from the way in: the radio reports the repeater
+        # hashes every packet crossed, and the reverse of that is the route
+        # home. Verified on the bench -- a packet arrived over [97 76] and
+        # its ack returned over [76 97].
+        self.learn_path_from_rx = str(cfg.get("learn_path_from_rx", "yes")).lower() in ("yes", "true", "1")
+        self.rx_path_max_age_s = float(cfg.get("rx_path_max_age", 3.0))
         self.peer_ttl_s = float(cfg.get("peer_ttl", 86400))
         self.debug = str(cfg.get("debug_level", "info")).lower() == "debug"
 
@@ -954,6 +1004,12 @@ class MeshCore_Raw_Interface(Interface):
 
         self._announce_sent_times, self._announce_sent_lock = {}, threading.Lock()
         self._path_req_sent_times, self._path_req_sent_lock = {}, threading.Lock()
+        # the hops of the packet the radio reported most recently, and when
+        self._rx_path, self._rx_path_at = None, 0.0
+        self._installed_paths = {}
+        # the hops a given peer's packets reach us over -- which is that peer's
+        # route to us, and the one thing it cannot work out for itself
+        self._heard_paths = {}
         self._path_response_pending, self._path_response_pending_lock = {}, threading.Lock()
         self._pending_resp_task = None
         self._tasks = []
@@ -993,6 +1049,7 @@ class MeshCore_Raw_Interface(Interface):
     async def _async_setup(self):
         self._mc = _Companion(self.link_cfg, self._log, self._loop)
         self._mc.on_raw_data     = self._on_raw_data
+        self._mc.on_packet_path  = self._note_rx_path
         self._mc.on_channel_data = self._on_channel_data
         self._mc.on_disconnect   = self._on_link_lost
         await self._bring_up(first=True)
@@ -1088,8 +1145,25 @@ class MeshCore_Raw_Interface(Interface):
         if not self.online or not self._own_key:
             return
         ftype = _Frame.T_BIND_REQ if is_req else _Frame.T_BIND
+        # A node learns its own outbound route by reversing the hops of the
+        # traffic it receives -- so the quiet end of an asymmetric link, which
+        # receives least, learns least, exactly where a route would help most.
+        # The other end already knows: the hops it hears us over ARE our route
+        # to it. Append that, so each side hands the other what it cannot work
+        # out alone. Older builds read the 32-byte key and ignore the rest.
+        body = bytes(self._own_key)
+        if self.learn_path_from_rx:
+            with self._peer_lock:
+                heard = dict(self._heard_paths)
+            # Each entry is addressed: BIND goes to the whole channel, and
+            # without a target prefix every other node would install a route
+            # meant for somebody else.
+            for peer, path in list(heard.items())[:4]:
+                path = bytes(path)[:63]
+                if path:
+                    body += bytes(peer[:4]) + bytes([len(path)]) + path
         frame = _Frame.build(ftype, self._own_prefix, _Frame.BROADCAST, self._next_pkt_id(),
-                             [self._own_key], can_route=self.can_route)[0]
+                             [body], can_route=self.can_route)[0]
         await self._mc.send_channel_data(self.channel_idx, self.data_type, frame)
 
     async def _bind_discovery_loop(self):
@@ -1166,6 +1240,24 @@ class MeshCore_Raw_Interface(Interface):
                 self._dbg(f"added contact for {pubkey.hex()[:8]}")
             except Exception as e:
                 self._log(f"add_contact failed for {pubkey.hex()[:8]}: {e}", RNS.LOG_WARNING)
+        # If the peer appended the hops it hears us over, that is our route to
+        # it, already the right way round -- no reversal, it is their view of
+        # our packets. Only the entry addressed to us is ours to install.
+        body = f["payload"]
+        if self.learn_path_from_rx and self.allow_direct:
+            i = 32
+            while i + 5 <= len(body):
+                target, n = bytes(body[i:i + 4]), body[i + 4]
+                if n == 0 or n > 63 or i + 5 + n > len(body):
+                    break
+                told = bytes(body[i + 5:i + 5 + n])
+                i += 5 + n
+                if target != self._own_prefix:
+                    continue
+                if self._installed_paths.get(prefix) != told:
+                    self._installed_paths[prefix] = told
+                    self._loop.create_task(self._install_path(prefix, pubkey, told))
+
         if is_req:
             if self._pending_resp_task is None or self._pending_resp_task.done():
                 self._pending_resp_task = self._loop.create_task(self._delayed_bind_response())
@@ -1228,6 +1320,46 @@ class MeshCore_Raw_Interface(Interface):
 
     # ---------------------------------------------------------------- inbound
 
+    def _note_rx_path(self, path):
+        """Remember the hops a packet just crossed.
+
+        The radio reports this immediately before it hands over the packet
+        itself, so the frame decoded next is the one that travelled it.
+        """
+        self._rx_path, self._rx_path_at = path, time.monotonic()
+
+    def _learn_return_path(self, prefix):
+        """Install the reverse of the path the last packet arrived over.
+
+        A packet that reached us via repeaters [a, b] goes home via [b, a];
+        anything older than a few seconds belongs to a different packet and is
+        ignored rather than guessed at.
+        """
+        path, at = self._rx_path, self._rx_path_at
+        if not path or time.monotonic() - at > self.rx_path_max_age_s:
+            return
+        with self._peer_lock:
+            self._heard_paths[prefix] = bytes(path)
+        back = bytes(reversed(path))
+        if self._installed_paths.get(prefix) == back:
+            return
+        pubkey = self._peers.get(prefix)
+        if pubkey is None:
+            return
+        self._installed_paths[prefix] = back
+        self._loop.create_task(self._install_path(prefix, pubkey, back))
+
+    async def _install_path(self, prefix, pubkey, back):
+        try:
+            if self._mc.contact_by_prefix(pubkey.hex()[:8]) is None:
+                await self._mc.add_contact(pubkey, f"RNS-{pubkey.hex()[:8]}")
+            n = await self._mc.set_contact_path(pubkey, back)
+            self._log(f"return path to {prefix.hex()}: {n} hop(s) [{back.hex()}] "
+                      f"(reversed from the packet that arrived)")
+        except Exception as e:
+            self._installed_paths.pop(prefix, None)
+            self._log(f"could not set return path for {prefix.hex()}: {e}", RNS.LOG_WARNING)
+
     def _on_raw_data(self, payload, snr, rssi):
         self._loop.create_task(self._on_frame(payload, "RAW", snr))
 
@@ -1255,6 +1387,14 @@ class MeshCore_Raw_Interface(Interface):
         with self._peer_lock:
             if src in self._peer_last_seen:
                 self._peer_last_seen[src] = now
+
+        # Learn here, not after reassembly: an announce is two fragments and
+        # only the last one completes a packet, so learning downstream of the
+        # assembler threw away most of the chances. Every fragment carries the
+        # sender prefix in its own header and every fragment crossed the same
+        # repeaters, so every fragment can teach the way back.
+        if self.learn_path_from_rx and self.allow_direct:
+            self._learn_return_path(src)
 
         with self._seen_lock:
             exp = self._seen_pkts.get(key)
